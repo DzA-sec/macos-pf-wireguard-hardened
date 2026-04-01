@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Unique daemon identifier — must match filename -->
+  <key>Label</key>
+  <string>com.user.pfctl.enable</string>
+
+  <!-- Enable PF and load rules from pf.conf
+       sleep 5 — wait for network interfaces to initialize before loading rules
+       -q      — quiet mode, suppress output
+       -e      — enable PF
+       -f      — load rules from specified file -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>sleep 5 && /sbin/pfctl -q -e -f /etc/pf.conf</string>
+  </array>
+
+  <!-- Run automatically at system boot -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Do not keep process alive — pfctl is a one-shot command,
+       it loads the rules and exits immediately -->
+  <key>KeepAlive</key>
+  <false/>
+
+  <!-- Auto-reload rules when pf.conf is modified
+       Any change to pf.conf triggers automatic rule reload
+       without requiring manual pfctl -f or system restart -->
+  <key>WatchPaths</key>
+  <array>
+    <string>/etc/pf.conf</string>
+  </array>
+
+  <!-- Daemon logs — separate from PF packet logs (/var/log/pf.log)
+       Check these if PF fails to load at boot -->
+  <key>StandardOutPath</key>
+  <string>/var/log/pf_autoload.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/pf_autoload_error.log</string>
+</dict>
+</plist>
