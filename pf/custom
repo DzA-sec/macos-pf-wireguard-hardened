@@ -1,0 +1,487 @@
+# =============================================================================
+# pf.conf — Hardened macOS Packet Filter Configuration
+# =============================================================================
+# Author   : DzA-sec
+# Platform : macOS 26.4
+# Stack    : PF Firewall + WireGuard VPN + DNSCrypt-proxy
+#
+# Architecture:
+#   Wi-Fi (en0)
+#     └── Only: DHCP + Bootstrap DNS + WireGuard handshake
+#           └── KILL-SWITCH: block everything else on physical interfaces
+#                 └── WireGuard tunnel (utun*)
+#                       └── DNSCrypt encrypted DNS
+#                             └── All traffic (TCP/UDP/ICMP)
+#
+# Threat Model:
+#   ✓ VPN traffic leak (kill-switch)
+#   ✓ DNS leak (DNS locked to 127.0.0.1 only)
+#   ✓ DNS hijacking (DNSCrypt whitelist only)
+#   ✓ Bogon/reserved IP traffic
+#   ✓ TCP port scanning (invalid flag combinations)
+#   ✓ QUIC/DoQ DNS bypass (UDP 443/853 blocked inside VPN)
+#   ✓ IPv6 leak (IPv6 blocked on all non-loopback interfaces)
+#   ✓ mDNS/SSDP/NetBIOS information leakage
+#   ✓ State table exhaustion (aggressive limits)
+#
+# Intentionally disabled:
+#   ✗ HTTP/3 (QUIC) — UDP 443 blocked, deliberate security trade-off
+#   ✗ IPv6 — blocked globally to prevent bypass
+#   ✗ mDNS — blocks local network discovery
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# PERFORMANCE & STATE TABLE LIMITS
+# Must be set before any rules — applies globally to PF engine
+# -----------------------------------------------------------------------------
+
+# Maximum number of simultaneous tracked connections
+# Default is ~10000 — we increase to handle modern browsing workloads
+set limit states 50000
+
+# Maximum number of packet fragments held in memory for reassembly
+# Prevents memory exhaustion from fragmentation attacks
+set limit frags  10000
+
+# State timeout optimization profile
+# "aggressive" — closes half-open and idle states faster
+# Critical for WireGuard: cleans up stale states after VPN reconnects
+# Other options: default, high-latency, conservative
+set optimization aggressive
+
+
+# =============================================================================
+# (A) MACROS AND TABLES
+# Macros = named variables for interfaces
+# Tables = named sets of IP addresses (efficient lookup vs. long lists)
+# =============================================================================
+
+# Primary Wi-Fi interface — physical uplink to router
+wifi    = "en0"
+
+# WireGuard creates virtual tunnel interfaces named utun0..utun15
+# macOS assigns utun numbers dynamically — we cover the full range
+# "$vpn" expands to all utun interfaces in every rule that uses it
+vpn     = "{ utun0 utun1 utun2 utun3 utun4 utun5 utun6 utun7 utun8 utun9 utun10 utun11 utun12 utun13 utun14 utun15 }"
+
+# All physical and virtual uplink interfaces
+# Used in kill-switch rule (F) to block non-VPN egress on ALL uplinks
+# Covers: Wi-Fi, Ethernet, Thunderbolt bridge, cellular (pdp_ip0), ANPI
+uplinks = "{ en0 en1 en2 en3 en4 en5 bridge0 ap1 pdp_ip0 anpi0 anpi1 }"
+
+# WireGuard server endpoint IPs
+# Only these IPs are allowed UDP/TCP before the tunnel is up
+# Replace with your actual WireGuard server IP(s)
+table <wg_endpoints> persist { YOUR_WG_SERVER_IP }
+
+# Bootstrap DNS servers — used ONLY for initial WireGuard handshake
+# Strictly whitelisted: only these IPs can receive DNS queries before VPN is up
+# Once tunnel is up, all DNS goes through DNSCrypt on 127.0.0.1
+# Replace with your preferred bootstrap DNS (e.g. 1.1.1.1 or 9.9.9.9)
+table <bootstrap_dns> persist { YOUR_BOOTSTRAP_DNS_IP }
+
+# DNSCrypt upstream resolver IPs
+# These are whitelisted inside the VPN tunnel for encrypted DNS traffic
+# Must match the server IP in your dnscrypt-proxy.toml
+# Replace with your actual DNSCrypt server IP
+table <dnscrypt_upstream> persist { YOUR_DNSCRYPT_SERVER_IP }
+
+# iPhone Personal Hotspot subnet — blocked to prevent accidental tunnel bypass
+# When iPhone hotspot is active, macOS may route traffic through it instead of VPN
+# 172.20.10.0/28 is Apple's fixed subnet for Personal Hotspot
+table <tether_subnet> persist { 172.20.10.0/28 }
+
+# Bogon (bogus) IP addresses — RFC-reserved ranges that should never appear
+# on the public internet. Traffic to/from these IPs indicates misconfiguration,
+# spoofing, or attack attempts.
+# Note: 10.0.0.0/8 and 192.168.0.0/16 intentionally excluded —
+# WireGuard uses these ranges for internal tunnel addressing
+table <bogons> persist {
+    0.0.0.0/8,          # "This" network (RFC 1122)
+    100.64.0.0/10,      # Shared address space (RFC 6598) — carrier-grade NAT
+    127.0.0.0/8,        # Loopback (RFC 1122) — handled separately on lo0
+    169.254.0.0/16,     # Link-local / APIPA (RFC 3927)
+    172.16.0.0/12,      # Private range (RFC 1918) — not used by our WG subnet
+    192.0.0.0/24,       # IETF Protocol Assignments (RFC 6890)
+    192.0.2.0/24,       # TEST-NET-1 documentation range (RFC 5737)
+    192.88.99.0/24,     # IPv6-to-IPv4 relay (RFC 3068, deprecated)
+    198.18.0.0/15,      # Benchmarking (RFC 2544)
+    198.51.100.0/24,    # TEST-NET-2 documentation range (RFC 5737)
+    203.0.113.0/24,     # TEST-NET-3 documentation range (RFC 5737)
+    224.0.0.0/4,        # IPv4 multicast (RFC 1112)
+    240.0.0.0/4,        # Reserved (RFC 1112)
+    255.255.255.255/32  # Limited broadcast
+}
+
+# WireGuard internal tunnel subnet
+# Your WireGuard server assigns IPs from this range to VPN clients
+# Must be whitelisted BEFORE bogon block rules — otherwise WG traffic
+# from your internal IP (e.g. 10.8.0.x) would be blocked as bogon
+# Replace with your actual WireGuard internal subnet
+table <wg_internal> persist { YOUR_WG_INTERNAL_SUBNET }  # e.g. 10.x.x.0/24
+
+# Dynamic table — populated automatically by rate-limiting rules (section G)
+# IPs that exceed connection rate limits are added here and blocked
+# "persist" keeps the table alive even when empty
+table <abusers> persist
+
+# NTP server IP for time sync BEFORE the VPN tunnel is established
+# Using a specific IP (not hostname) avoids DNS dependency at boot
+# 17.253.52.125 = time.apple.com (Apple NTP)
+# Using any NTP server before VPN reveals your real IP — whitelist limits exposure
+table <ntp_pre_tunnel> persist { 17.253.52.125 }
+
+
+# =============================================================================
+# (B) SCRUB — PACKET NORMALIZATION
+# Scrub rules normalize packets before filtering
+# Prevents evasion techniques that exploit fragmentation or IP options
+# =============================================================================
+
+# Normalize ALL incoming packets:
+# - "no-df" : clear the "Don't Fragment" bit — prevents DF-based fingerprinting
+# - "random-id" : randomize IP ID field — prevents OS fingerprinting via IP ID sequences
+# - "fragment reassemble" : reassemble fragments before filtering (implicit with random-id)
+scrub in all no-df random-id
+
+# Clamp MSS (Maximum Segment Size) on all VPN tunnel interfaces
+# WireGuard adds ~60 bytes of overhead per packet (UDP header + WG header + crypto)
+# Without MSS clamping, packets exceed MTU → fragmentation → performance degradation
+# 1380 = 1500 (Ethernet MTU) - 60 (WireGuard overhead) - 60 (TCP/IP headers) ≈ safe value
+scrub out on $vpn max-mss 1380
+
+# --- ANTI-SPOOFING ---
+
+# Block packets on Wi-Fi where source IP doesn't match the interface's routing table
+# Prevents IP spoofing attacks where attacker forges source addresses
+# "antispoof" generates: block in on en0 from !en0:network to any
+antispoof quick for $wifi
+
+# Same anti-spoof protection on VPN tunnel interfaces
+# Prevents traffic injection into the tunnel from unexpected sources
+antispoof quick for $vpn
+
+# Drop packets on Wi-Fi that fail Unicast Reverse Path Forwarding check
+# uRPF verifies: "would we route a reply back through the same interface?"
+# Fails for spoofed source IPs → drop them immediately
+block drop quick on $wifi from urpf-failed
+
+
+# =============================================================================
+# (C) DEFAULT POLICY — DENY ALL
+# PF processes rules top-to-bottom, last matching rule wins (unless "quick")
+# Starting with "block all" means nothing passes unless explicitly allowed
+# =============================================================================
+
+# Block ALL inbound traffic on ALL interfaces by default
+# Every pass rule below is an explicit exception to this
+block in all
+
+# Block ALL outbound traffic on ALL interfaces by default
+block out all
+
+
+# =============================================================================
+# (C.1) BOGON FILTERING ON WI-FI
+# Block traffic to/from RFC-reserved IP ranges on the physical Wi-Fi interface
+# These IPs should never appear in legitimate internet traffic
+# "log" writes blocked packets to /var/log/pf.log for analysis
+# =============================================================================
+
+# Block incoming packets FROM bogon source addresses on Wi-Fi
+# Protects against: spoofed packets, misconfigured routers, attack probes
+block drop log quick on $wifi from <bogons> to any
+
+# Block outgoing packets TO bogon destination addresses on Wi-Fi
+# Prevents: accidental LAN leakage, misconfigured apps, SSRF-style attacks
+block drop log quick on $wifi from any to <bogons>
+
+
+# =============================================================================
+# (D) DNS ISOLATION — LOOPBACK ONLY
+# Force ALL DNS traffic through DNSCrypt-proxy running on 127.0.0.1:53
+# Any DNS query that bypasses loopback is blocked — prevents DNS leaks
+# =============================================================================
+
+# Block any DNS query arriving on non-loopback interfaces (inbound)
+# Prevents: external DNS servers pushing responses, DNS rebinding attacks
+block in log quick on ! lo0 proto { udp tcp } to port 53
+
+# Block any DNS query leaving on non-loopback interfaces (outbound)
+# This is the key DNS leak prevention rule:
+# No app can send DNS directly to 8.8.8.8 or any external resolver
+# All DNS MUST go to 127.0.0.1 where DNSCrypt-proxy handles it
+block out log quick on ! lo0 proto { udp tcp } to port 53
+
+# Allow DNS traffic on loopback interface only (127.0.0.1 ↔ 127.0.0.1)
+# This is how apps talk to DNSCrypt-proxy:
+# App → 127.0.0.1:53 (DNSCrypt-proxy) → encrypted → VPN → upstream resolver
+# "keep state" tracks the connection for stateful filtering
+pass quick on lo0 proto { udp tcp } from { 127.0.0.1, ::1 } to { 127.0.0.1, ::1 } port 53 keep state
+
+# Allow Tor and Tor Browser SOCKS proxy on loopback
+# Tor listens on 9050 (tor daemon), 9150/9151 (Tor Browser)
+# Same isolation principle: only loopback, not external interfaces
+pass quick on lo0 proto tcp from { 127.0.0.1, ::1 } to { 127.0.0.1, ::1 } port { 9050, 9150, 9151 } keep state
+
+
+# =============================================================================
+# (E) PRE-TUNNEL RULES — MINIMAL WHITELIST BEFORE VPN IS UP
+# Only the absolute minimum traffic needed to establish the WireGuard tunnel
+# Everything else is blocked by kill-switch in section (F)
+# Order matters: these rules must come BEFORE the kill-switch block
+# =============================================================================
+
+# DHCP — required to obtain IP address from router
+# Client sends from port 68, server responds from port 67
+# Without DHCP the interface has no IP → can't reach WireGuard server
+pass out quick on $wifi proto udp from port 68 to port 67 keep state
+
+# DHCP response — allow router's DHCP offer back in
+# Rate-limited to 10 packets/60 seconds — prevents DHCP flood attacks
+pass in quick on $wifi proto udp from port 67 to port 68 \
+  keep state (max-src-conn-rate 10/60)
+
+# Bootstrap DNS — only to whitelisted IPs, only for WireGuard handshake phase
+# WireGuard needs to resolve server hostname before tunnel is up
+# Strictly limited to <bootstrap_dns> table — no other DNS allowed pre-tunnel
+pass out quick on $wifi proto { udp tcp } to <bootstrap_dns> port 53 keep state
+
+# WireGuard UDP handshake — primary protocol
+# Ports 3462 and 3155 are custom WireGuard ports on this server
+# "log" records handshake packets to pf.log for connection debugging
+pass out log quick on $wifi proto udp to <wg_endpoints> port { 3462, 3155 } keep state
+
+# WireGuard TCP fallback — for networks that block UDP (hotel WiFi, captive portals)
+# WireGuard can tunnel over TCP/443 to bypass restrictive firewalls
+pass out log quick on $wifi proto tcp to <wg_endpoints> port 443 keep state
+
+# NTP time sync before tunnel — strictly limited to Apple's time server
+# macOS needs accurate time for certificate validation and Kerberos
+# Using specific IP (not "any") limits real IP exposure to one trusted server
+pass out quick on $wifi proto udp to <ntp_pre_tunnel> port 123 keep state
+
+# Block iPhone Personal Hotspot subnet — prevent tunnel bypass via tethering
+# If iPhone hotspot activates, macOS might route traffic through it
+# Explicitly blocking this subnet ensures VPN kill-switch stays effective
+block drop quick on $wifi to   <tether_subnet>
+block drop quick on $wifi from <tether_subnet>
+
+
+# =============================================================================
+# (F) KILL-SWITCH — HARD BLOCK ON ALL PHYSICAL INTERFACES
+# This is the core security guarantee of the entire configuration
+# After the whitelist exceptions above, block EVERYTHING on physical links
+# Traffic can ONLY leave through the WireGuard tunnel (utun*)
+# If WireGuard disconnects → internet stops → no traffic leak
+# "log" ensures all blocked traffic is recorded for audit
+# =============================================================================
+
+block drop log quick on $uplinks all
+
+
+# =============================================================================
+# (G) VPN TUNNEL RULES — TRAFFIC INSIDE WIREGUARD (utun*)
+# Rules in this section control what can flow through the VPN tunnel
+# Order is critical — "quick" causes immediate rule match and exit
+# =============================================================================
+
+# --- G.0 WireGuard Internal Subnet Exemption ---
+# MUST come before bogon block rules
+# Your WireGuard server assigns you an internal IP (e.g. 10.8.0.x)
+# This IP falls in 10.0.0.0/8 which would be blocked as bogon
+# We explicitly allow WireGuard internal subnet traffic first
+pass out quick on $vpn from <wg_internal> to any keep state
+pass in  quick on $vpn from any to <wg_internal> keep state
+
+# Block bogon traffic inside VPN tunnel
+# Even inside the tunnel, traffic to/from bogon IPs is suspicious
+# Could indicate: VPN server misconfiguration, routing leak, MITM
+block drop log quick on $vpn from <bogons> to any
+block drop log quick on $vpn from any to <bogons>
+
+# --- G.1 DNSCrypt Upstream Whitelist ---
+# MUST come before the DNS block rule below
+# Allow encrypted DNS traffic to our specific DNSCrypt resolver
+# Ports: 53 (plain DNS fallback), 853 (DNS-over-TLS), 443 (DNS-over-HTTPS)
+# Only <dnscrypt_upstream> IPs are allowed — all other DNS is blocked
+pass out quick on $vpn proto { udp tcp } to <dnscrypt_upstream> port { 53, 853, 443 } keep state
+
+# --- G.2 NTP Through VPN ---
+# Time synchronization inside the tunnel
+# NTP through VPN hides time sync queries from ISP
+# "inet" = IPv4 only (we block IPv6 globally)
+pass out quick on $vpn inet proto udp to any port 123 keep state
+
+# --- G.3 Block Unauthorized DNS ---
+# Block all DNS/DoT queries EXCEPT to whitelisted DNSCrypt upstream (rule G.1)
+# Prevents: apps bypassing DNSCrypt, DNS leaks through VPN, DoT bypass
+# Any DNS query not matching G.1 whitelist hits this block
+block out quick on $vpn inet proto { udp tcp } to port { 53, 853 }
+
+# --- G.4 Block Junk Traffic Inside VPN ---
+# Link-local addresses (169.254.x.x) — should never route through VPN
+# These are auto-assigned when DHCP fails — no legitimate use in tunnel
+block out quick on $vpn to 169.254.0.0/16
+
+# Multicast traffic has no place in a point-to-point VPN tunnel
+# Blocking prevents multicast leakage through the tunnel
+block out quick on $vpn to 224.0.0.0/4
+
+# --- G.5 Block QUIC and DoQ ---
+# QUIC (HTTP/3) runs over UDP/443 — blocking it forces HTTP/2 (TCP)
+# Reason: QUIC's connection migration can cause IP leaks in some VPN setups
+# DoQ (DNS-over-QUIC) runs over UDP/853 — blocked to enforce DNSCrypt
+# Trade-off: ~25% of sites use HTTP/3 → they fall back to HTTP/2 automatically
+block out quick on $vpn proto udp to   any port { 443, 853 }
+block in  quick on $vpn proto udp from any port { 443, 853 }
+
+# --- G.6 Rate Limiting (MUST be before broad pass rules) ---
+# Rate limiting only works on NEW connections (first SYN packet)
+# If broad "pass all" comes first, it creates state before rate-limit rule sees it
+# overload <abusers>: IPs exceeding limits are added to abusers table
+# flush global: immediately kill ALL existing states from that IP
+
+# TCP rate limiting:
+# max-src-conn 400      = maximum 400 simultaneous connections per source IP
+# max-src-conn-rate 200/30 = maximum 200 new connections per 30 seconds per source IP
+# Protects against: connection floods, port scanning, DoS via TCP
+pass out quick on $vpn proto tcp all flags S/SA \
+  keep state (max-src-conn 400, max-src-conn-rate 200/30, overload <abusers> flush global)
+
+# UDP rate limiting:
+# max-src-conn-rate 600/30 = maximum 600 UDP packets per 30 seconds per source IP
+# Higher limit than TCP — UDP is connectionless, legitimate use is higher volume
+# Protects against: UDP flood, DNS amplification, NTP amplification
+pass out quick on $vpn proto udp from any to any \
+  keep state (max-src-conn-rate 600/30, overload <abusers> flush global)
+
+# --- G.7 Block Abusers ---
+# IPs added to <abusers> table by rate-limit rules above are blocked here
+# "log" records every blocked abuser packet for security audit
+# Table persists until manually cleared: sudo pfctl -t abusers -T flush
+block out log quick from <abusers> to any
+
+# --- G.8 Allow Remaining Outbound VPN Traffic ---
+# At this point only legitimate traffic remains:
+# - Not bogon, not unauthorized DNS, not QUIC, not rate-limited
+# ICMP is allowed for: ping, traceroute, path MTU discovery
+# TCP and UDP already handled by rate-limiting rules above (G.6)
+pass out quick on $vpn proto icmp all keep state
+
+# --- G.9 Allow Inbound VPN Traffic ---
+# Explicit inbound rules — don't rely on implicit stateful return traffic
+# More readable and easier to audit than implicit state-based return
+# TCP: all established and new connections
+pass in quick on $vpn proto tcp  all keep state
+# UDP: all traffic (stateless protocol — PF tracks by 5-tuple)
+pass in quick on $vpn proto udp  all keep state
+# ICMP: ping replies, TTL exceeded (traceroute), unreachable messages
+pass in quick on $vpn proto icmp all keep state
+
+
+# =============================================================================
+# (H) NOISY NEIGHBOR BLOCKING
+# Block interfaces and protocols that generate unwanted local network traffic
+# These are legitimate macOS features — we disable them for privacy
+# =============================================================================
+
+# AWDL (Apple Wireless Direct Link) — used by AirDrop, AirPlay
+# Broadcasts your device presence on local network continuously
+block quick on awdl0 all
+
+# Low-latency WLAN (llw0) — companion interface to AWDL
+# Handles time-sensitive AWDL traffic (same privacy concern as awdl0)
+block quick on llw0 all
+
+# Legacy peer-to-peer interface — used by older AirDrop implementations
+block quick on p2p0 all
+
+# Block multicast on Wi-Fi — prevents joining/sending multicast groups
+# Multicast is used by mDNS, SSDP, and various discovery protocols
+block quick on $wifi proto udp to   224.0.0.0/4
+block quick on $wifi proto udp from 224.0.0.0/4
+
+# mDNS (Multicast DNS) — port 5353
+# Used by Bonjour to advertise services on local network
+# Leaks: device name, running services, OS version to local network
+block quick on $wifi proto udp to port 5353
+
+# LLMNR (Link-Local Multicast Name Resolution) — port 5355
+# Windows name resolution protocol — not needed on macOS
+# Can be abused for LLMNR poisoning attacks on local network
+block quick on $wifi proto udp to port 5355
+
+# NetBIOS and SMB — Windows file/printer sharing protocols
+# Ports: 137 (NetBIOS name), 138 (NetBIOS datagram), 139 (NetBIOS session), 445 (SMB)
+# Blocking prevents: SMB relay attacks, NetBIOS poisoning, unwanted shares
+block quick on $wifi proto { udp tcp } to port { 137, 138, 139, 445 }
+
+# SSDP (Simple Service Discovery Protocol) — port 1900
+# Used by UPnP to discover devices (smart TVs, routers, IoT)
+# Leaks device information, can be used for UPnP-based attacks
+block quick on $wifi proto udp to port 1900
+
+
+# =============================================================================
+# (I) TCP HARDENING — INVALID FLAG COMBINATIONS
+# Block TCP packets with flag combinations that no legitimate TCP stack sends
+# These patterns are signatures of: port scanners, OS fingerprinting tools,
+# network mappers (nmap), and various evasion techniques
+#
+# TCP flags: F=FIN, S=SYN, R=RST, P=PSH, A=ACK, U=URG
+# Format: flags CHECK/MASK — check these flags within this mask
+# =============================================================================
+
+# FUP scan — FIN+URG+PSH set (Xmas-lite variant)
+# No legitimate TCP connection uses this combination
+# nmap -sX variant, used for firewall evasion on some systems
+block in log quick proto tcp from any to any flags FUP/FUP
+
+# NULL scan — no flags set at all
+# A valid TCP packet must have at least one flag
+# Used by: nmap -sN, firewall evasion, OS detection
+block in log quick proto tcp from any to any flags /SFRAUP
+
+# FIN scan — only FIN flag set (no SYN, no ACK)
+# Legitimate FIN only appears in established connections (with ACK)
+# Standalone FIN = nmap -sF port scan technique
+block in log quick proto tcp from any to any flags F/SFRAUP
+
+# SYN+FIN scan — SYN and FIN set simultaneously
+# Impossible in legitimate TCP — SYN opens, FIN closes, never together
+# Used for: firewall evasion, OS fingerprinting, IDS evasion
+block in log quick proto tcp from any to any flags SF/SFRAUP
+
+
+# =============================================================================
+# (J) IPv6 — GLOBAL BLOCK
+# IPv6 is blocked on all non-loopback interfaces
+# Reason: WireGuard tunnel in this config handles IPv4 only
+# IPv6 traffic would bypass the VPN tunnel entirely → IP leak
+# If your VPN supports IPv6, remove these rules and configure accordingly
+# =============================================================================
+
+# Block all outbound IPv6 on non-loopback interfaces
+block out quick on ! lo0 inet6 all
+
+# Block all inbound IPv6 on non-loopback interfaces
+block in  quick on ! lo0 inet6 all
+
+# =============================================================================
+# END OF CONFIGURATION
+# =============================================================================
+#
+# Useful commands:
+#   sudo pfctl -f /etc/pf.conf        — reload rules
+#   sudo pfctl -e / -d                — enable / disable PF
+#   sudo pfctl -sr                    — show active rules
+#   sudo pfctl -ss                    — show active states
+#   sudo pfctl -a custom -sr          — show rules in custom anchor
+#   sudo pfctl -t bogons -T show      — show bogon table contents
+#   sudo pfctl -t abusers -T show     — show blocked abusers
+#   sudo pfctl -t abusers -T flush    — clear abusers table
+#   sudo pfctl -s info                — show PF statistics
+#   bash scripts/check-leaks.sh      — run leak verification
+# =============================================================================
