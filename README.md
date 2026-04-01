@@ -18,7 +18,7 @@
 ---
 
 <a name="english"></a>
-# 🇬🇧 English
+#  English
 
 ## Goal
 
@@ -762,7 +762,7 @@ Issues and pull requests are welcome. If you find a bug or have an improvement, 
 ---
 
 <a name="deutsch"></a>
-# 🇩🇪 Deutsch
+#  Deutsch
 
 ## Ziel
 
@@ -1202,7 +1202,7 @@ dig google.com @127.0.0.1  # DNS testen
 ---
 
 <a name="russian"></a>
-# 🇷🇺 Русский
+#  Русский
 
 ## Цель
 
