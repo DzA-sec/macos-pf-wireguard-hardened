@@ -251,7 +251,7 @@ pass out quick on $wifi proto { udp tcp } to <bootstrap_dns> port 53 keep state
 # WireGuard UDP handshake — primary protocol
 # Ports 3462 and 3155 are custom WireGuard ports on this server
 # "log" records handshake packets to pf.log for connection debugging
-pass out log quick on $wifi proto udp to <wg_endpoints> port { 3462, 3155 } keep state
+pass out log quick on $wifi proto udp to <wg_endpoints> port { YOUR_WG_PORT } keep state
 
 # WireGuard TCP fallback — for networks that block UDP (hotel WiFi, captive portals)
 # WireGuard can tunnel over TCP/443 to bypass restrictive firewalls
