@@ -251,14 +251,12 @@ block drop quick on $wifi from urpf-failed
 
 pass quick on lo0 all
 
-
 # =============================================================================
 # (D) DEFAULT POLICY — DENY ALL
 # =============================================================================
 
 block in  all
 block out all
-
 
 # =============================================================================
 # (D.1) IPv6 GLOBAL BLOCK
@@ -289,7 +287,6 @@ block in  log quick on $vpn     proto 41
 
 block out quick on $uplinks from 127.0.0.0/8
 block out quick on $uplinks from ::1
-
 
 # =============================================================================
 # (D.3) BOGON FILTERING ON WI-FI
@@ -355,7 +352,6 @@ pass quick on lo0 proto tcp \
 # Privoxy HTTP proxy — uncomment if used
 # pass quick on lo0 inet proto tcp from 127.0.0.1 to 127.0.0.1 port 8118 flags S/SA keep state
 
-
 # =============================================================================
 # (F) PRE-TUNNEL RULES — MINIMAL WHITELIST BEFORE VPN IS UP
 # All rules MUST come before kill-switch (G)
@@ -411,7 +407,6 @@ block quick on $wifi proto udp to port 5355
 block quick on $wifi proto { udp tcp } to port { 137, 138, 139, 445 }
 block quick on $wifi proto udp to port 1900
 
-
 # =============================================================================
 # (F.2) TCP HARDENING ON UPLINKS — BEFORE KILL-SWITCH
 # Both "in" and "out" directions — catches outbound scanner activity too.
@@ -444,13 +439,13 @@ block in  log quick on $uplinks proto sctp
 block out log quick on $uplinks proto gre
 block in  log quick on $uplinks proto gre
 
-
 # =============================================================================
 # (G) KILL-SWITCH — HARD BLOCK ALL PHYSICAL INTERFACES
 # WireGuard drops → internet stops → no leak, no bypass.
 # =============================================================================
 
 block drop log quick on $uplinks all
+
 # =============================================================================
 # (H) VPN TUNNEL RULES — TRAFFIC INSIDE WIREGUARD ($vpn = utun*)
 # Order is critical — "quick" exits immediately on first match.
@@ -555,6 +550,7 @@ block in log   quick on $vpn inet proto icmp all
 #
 #   max-src-conn 20 still applies — limits half-open states if the
 #   WireGuard server itself is compromised or misbehaves.
+
 pass in quick on $vpn inet proto tcp flags S/SA \
     keep state (max-src-conn 20, max-src-conn-rate 50/10, \
     overload <abusers> flush global)
@@ -565,6 +561,7 @@ pass in quick on $vpn inet proto udp \
 
 block drop log quick on $vpn proto udp
 block drop log on $vpn all
+
 # =============================================================================
 # END OF CONFIGURATION
 # =============================================================================
