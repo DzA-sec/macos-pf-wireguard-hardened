@@ -16,7 +16,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>sleep 5 && /sbin/pfctl -q -e -f /etc/pf.conf</string>
+    <string>sleep 10 && /sbin/pfctl -q -e -f /etc/pf.conf</string>
   </array>
 
   <!-- Run automatically at system boot -->
