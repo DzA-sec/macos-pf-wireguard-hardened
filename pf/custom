@@ -244,8 +244,7 @@ block drop quick on $wifi from urpf-failed
 # =============================================================================
 # (C) LOOPBACK EXPLICIT PASS
 # [FIX 7] Placed immediately before default deny.
-# Without this, loopback works only because specific port rules open it.
-# Explicit pass makes the intent clear and prevents regression if DNS/Tor
+# Explicit pass makes the intent clear and prevents regression if DNS
 # rules are reordered or removed.
 # =============================================================================
 
@@ -344,10 +343,6 @@ block in  log quick on ! lo0 proto { udp tcp } to   port 53
 block out log quick on ! lo0 proto { udp tcp } to   port 53
 block in  log quick on ! lo0 proto { udp tcp } from port 53
 block out log quick on ! lo0 proto { udp tcp } from port 53
-
-# Tor SOCKS proxy — loopback only
-pass quick on lo0 proto tcp \
-    from { 127.0.0.1, ::1 } to { 127.0.0.1, ::1 } port { 9050, 9150, 9151 } keep state
 
 # Privoxy HTTP proxy — uncomment if used
 # pass quick on lo0 inet proto tcp from 127.0.0.1 to 127.0.0.1 port 8118 flags S/SA keep state
